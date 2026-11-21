@@ -7,6 +7,8 @@
 //!   point 75 30%                     at 75°C: 30% of each fan's min..max range
 //!   point 85 2500                    at 85°C: 2500 RPM
 //!   point 95 max                     at 95°C and above: full speed
+//!   ramp_up = 50                     optional: speed up at most 50 RPM/s
+//!   ramp_down = 30                   optional: slow down at most 30 RPM/s
 //! Between two points the speed ramps linearly. A segment that starts at
 //! `auto` stays `auto` until the next point is reached.
 
@@ -24,6 +26,10 @@ pub enum Speed {
 pub struct Curve {
     pub sensors: Vec<String>,
     pub points: Vec<(f64, Speed)>,
+    /// Max RPM per second when speeding up. None = jump straight there.
+    pub ramp_up: Option<f64>,
+    /// Max RPM per second when slowing down. None = the built-in default.
+    pub ramp_down: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -54,13 +60,22 @@ impl Curve {
     pub fn parse(text: &str) -> Result<Curve, ParseError> {
         let mut sensors = Vec::new();
         let mut points: Vec<(f64, Speed)> = Vec::new();
+        let (mut ramp_up, mut ramp_down) = (None, None);
         for (i, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap().trim();
             let err = |msg: &str| ParseError { line: i + 1, msg: msg.to_string() };
             if line.is_empty() {
                 continue;
             }
-            if let Some(rest) = line.strip_prefix("sensors") {
+            if let Some((name, val)) = line.split_once('=')
+                && matches!(name.trim(), "ramp_up" | "ramp_down")
+            {
+                let v: f64 = val.trim().parse().map_err(|_| err("ramp must be a number of RPM per second"))?;
+                if !(v > 0.0 && v.is_finite()) {
+                    return Err(err("ramp must be more than 0 RPM per second"));
+                }
+                if name.trim() == "ramp_up" { ramp_up = Some(v) } else { ramp_down = Some(v) }
+            } else if let Some(rest) = line.strip_prefix("sensors") {
                 let rest = rest.trim_start().strip_prefix('=').ok_or_else(|| err("expected `sensors = ...`"))?;
                 sensors = rest.split_whitespace().map(String::from).collect();
             } else if let Some(rest) = line.strip_prefix("point") {
@@ -73,7 +88,7 @@ impl Curve {
                 }
                 points.push((t, s));
             } else {
-                return Err(err("unknown setting (expected `sensors =` or `point`)"));
+                return Err(err("unknown setting (expected `sensors =`, `point`, `ramp_up =` or `ramp_down =`)"));
             }
         }
         if sensors.is_empty() {
@@ -82,7 +97,7 @@ impl Curve {
         if points.is_empty() {
             return Err(ParseError { line: 0, msg: "no `point` lines".into() });
         }
-        Ok(Curve { sensors, points })
+        Ok(Curve { sensors, points, ramp_up, ramp_down })
     }
 
     pub fn matches(&self, key: &str) -> bool {
@@ -194,6 +209,14 @@ mod tests {
     }
 
     #[test]
+    fn ramps_parse() {
+        let c = Curve::parse("sensors = T*\npoint 70 max\nramp_up = 50\nramp_down=30\n").unwrap();
+        assert_eq!((c.ramp_up, c.ramp_down), (Some(50.0), Some(30.0)));
+        let d = Curve::parse("sensors = T*\npoint 70 max\n").unwrap();
+        assert_eq!((d.ramp_up, d.ramp_down), (None, None));
+    }
+
+    #[test]
     fn matching() {
         let c = Curve::parse(C).unwrap();
         assert!(c.matches("Tp0a") && c.matches("TCDX") && !c.matches("TCDY") && !c.matches("Tg05"));
@@ -205,5 +228,7 @@ mod tests {
         assert!(Curve::parse("sensors = T*\npoint 70 auto\npoint 60 max\n").is_err());
         assert!(Curve::parse("sensors = T*\npoint 70 fast\n").is_err());
         assert!(Curve::parse("sensors = T*\npoint 70 150%\n").is_err());
+        assert!(Curve::parse("sensors = T*\npoint 70 max\nramp_up = 0\n").is_err());
+        assert!(Curve::parse("sensors = T*\npoint 70 max\nramp_down = fast\n").is_err());
     }
 }

@@ -8,7 +8,8 @@ use crate::fanctl::Fan;
 pub const EMERGENCY_C: f64 = 100.0;
 /// How long the curve must ask for `auto` before we hand back to macOS.
 pub const AUTO_HOLD_S: f64 = 30.0;
-/// Fastest allowed ramp down per second (ramp up is immediate).
+/// Default ramp down per second when the curve doesn't set `ramp_down`.
+/// Ramp up defaults to immediate when the curve doesn't set `ramp_up`.
 pub const RAMP_DOWN_RPM_PER_S: f64 = 100.0;
 
 #[derive(Debug, PartialEq)]
@@ -43,7 +44,8 @@ impl Controller {
         let dt = self.last_t.map_or(0.0, |lt| (t - lt).max(0.0));
         self.last_t = Some(t);
 
-        let wanted: Vec<Option<f64>> = if temp >= EMERGENCY_C || !temp.is_finite() {
+        let emergency = temp >= EMERGENCY_C || !temp.is_finite();
+        let wanted: Vec<Option<f64>> = if emergency {
             self.fans.iter().map(|f| Some(f.max)).collect()
         } else {
             self.fans.iter().map(|f| curve.target(temp, f.min, f.max)).collect()
@@ -57,7 +59,8 @@ impl Controller {
                 return Decision::Auto;
             }
             // Still holding: ease toward each fan's minimum.
-            let held = self.ramp(&last, &self.fans.iter().map(|f| f.min).collect::<Vec<_>>(), dt);
+            let mins: Vec<f64> = self.fans.iter().map(|f| f.min).collect();
+            let held = self.ramp(curve, &last, &mins, dt, false);
             self.last = Some(held.clone());
             return Decision::Set(held);
         }
@@ -66,19 +69,32 @@ impl Controller {
         // A fan the curve leaves on auto while another is forced sits at its min.
         let want: Vec<f64> = wanted.iter().zip(&self.fans).map(|(w, f)| w.unwrap_or(f.min)).collect();
         let next = match &self.last {
-            Some(last) => self.ramp(last, &want, dt),
-            None => want,
+            Some(last) => self.ramp(curve, last, &want, dt, emergency),
+            // Taking over from macOS: with a ramp_up, start at each fan's minimum
+            // and climb; without one (or in an emergency), go straight there.
+            None if emergency || curve.ramp_up.is_none() => want,
+            None => self.fans.iter().map(|f| f.min).collect(),
         };
         self.last = Some(next.clone());
         Decision::Set(next)
     }
 
-    fn ramp(&self, last: &[f64], want: &[f64], dt: f64) -> Vec<f64> {
+    /// Move from `last` toward `want`, limited by the curve's ramp rates.
+    /// `instant_up` skips the up limit (emergency).
+    fn ramp(&self, curve: &Curve, last: &[f64], want: &[f64], dt: f64, instant_up: bool) -> Vec<f64> {
+        let down = curve.ramp_down.unwrap_or(RAMP_DOWN_RPM_PER_S);
         last.iter()
             .zip(want)
             .zip(&self.fans)
             .map(|((&l, &w), f)| {
-                let v = if w >= l { w } else { w.max(l - RAMP_DOWN_RPM_PER_S * dt) };
+                let v = if w >= l {
+                    match curve.ramp_up {
+                        Some(up) if !instant_up => w.min(l + up * dt),
+                        _ => w,
+                    }
+                } else {
+                    w.max(l - down * dt)
+                };
                 v.clamp(f.min, f.max)
             })
             .collect()
@@ -128,6 +144,32 @@ mod tests {
         assert_eq!(c.step(&curve(), 50.0, 32.0), Decision::Auto);
         // and back up if it heats again
         assert!(matches!(c.step(&curve(), 70.0, 34.0), Decision::Set(_)));
+    }
+
+    fn slow() -> Curve {
+        Curve::parse("sensors = T*\npoint 60 auto\npoint 65 0%\npoint 100 max\nramp_up = 50\nramp_down = 30\n").unwrap()
+    }
+
+    #[test]
+    fn slow_ramp_starts_at_min_and_climbs() {
+        let mut c = Controller::new(fans());
+        assert_eq!(c.step(&slow(), 95.0, 0.0), Decision::Set(vec![1500.0, 1500.0]));
+        assert_eq!(c.step(&slow(), 95.0, 2.0), Decision::Set(vec![1600.0, 1600.0]));
+        assert_eq!(c.step(&slow(), 95.0, 4.0), Decision::Set(vec![1700.0, 1700.0]));
+    }
+
+    #[test]
+    fn slow_ramp_down() {
+        let mut c = Controller::new(fans());
+        c.step(&slow(), 100.0, 0.0); // emergency: straight to max
+        assert_eq!(c.step(&slow(), 66.0, 2.0), Decision::Set(vec![5440.0, 5740.0]));
+    }
+
+    #[test]
+    fn emergency_skips_slow_ramp_up() {
+        let mut c = Controller::new(fans());
+        c.step(&slow(), 70.0, 0.0);
+        assert_eq!(c.step(&slow(), 101.0, 2.0), Decision::Set(vec![5500.0, 5800.0]));
     }
 
     #[test]
