@@ -1,17 +1,23 @@
+mod curve;
 mod smc;
 
 use smc::Smc;
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-const USAGE: &str = "gust: read-only Mac fan and temperature reader
+type Res = Result<(), Box<dyn std::error::Error>>;
+
+const USAGE: &str = "gust: Mac fan and temperature tool (read-only so far: nothing writes to the fans)
 
 usage:
   gust fans          fan RPM (actual, min, max, target) and mode
   gust temps         every temperature sensor, grouped by key prefix
   gust read KEY...   raw value of specific SMC keys (e.g. gust read F0Ac)
   gust keys          dump every SMC key with its type and value
-  gust snap          KEY VALUE lines for every temp + fan RPM (for logging)";
+  gust snap          KEY VALUE lines for every temp + fan RPM (for logging)
+  gust curve [FILE]  dry run: what the curve would set the fans to right now
+  gust curve --table [FILE]  the curve as a temp -> RPM table
+                     (FILE defaults to ~/.config/gust/curve.conf)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,6 +34,7 @@ fn main() -> ExitCode {
         Some("keys") => keys(&smc),
         Some("snap") => snap(&smc),
         Some("read") if args.len() > 1 => read(&smc, &args[1..]),
+        Some("curve") => curve_cmd(&smc, &args[1..]),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -46,7 +53,7 @@ fn num(smc: &Smc, key: &str) -> Option<f64> {
     smc.read(key).ok()?.as_f64()
 }
 
-fn fans(smc: &Smc) -> Result<(), smc::Error> {
+fn fans(smc: &Smc) -> Res {
     let count = num(smc, "FNum").unwrap_or(0.0) as u32;
     println!("{count} fan(s)");
     println!("{:<4} {:>7} {:>7} {:>7} {:>7}  mode", "fan", "actual", "min", "max", "target");
@@ -71,7 +78,7 @@ fn fans(smc: &Smc) -> Result<(), smc::Error> {
     Ok(())
 }
 
-fn temps(smc: &Smc) -> Result<(), smc::Error> {
+fn temps(smc: &Smc) -> Res {
     // Group by the first two characters (Tp, Te, Tg, TB...). Which prefix means
     // which part is not assumed here; we label them once matched against load.
     let mut groups: BTreeMap<String, Vec<(String, f64)>> = BTreeMap::new();
@@ -98,7 +105,7 @@ fn temps(smc: &Smc) -> Result<(), smc::Error> {
 }
 
 /// One line per numeric T* key and fan RPM: "KEY VALUE". For logging.
-fn snap(smc: &Smc) -> Result<(), smc::Error> {
+fn snap(smc: &Smc) -> Res {
     for key in smc.keys()? {
         if !(key.starts_with('T') || (key.starts_with('F') && key.ends_with("Ac"))) {
             continue;
@@ -114,7 +121,7 @@ fn snap(smc: &Smc) -> Result<(), smc::Error> {
     Ok(())
 }
 
-fn read(smc: &Smc, keys: &[String]) -> Result<(), smc::Error> {
+fn read(smc: &Smc, keys: &[String]) -> Res {
     for key in keys {
         if key.len() != 4 {
             eprintln!("{key:?}: SMC keys are 4 characters");
@@ -128,7 +135,7 @@ fn read(smc: &Smc, keys: &[String]) -> Result<(), smc::Error> {
     Ok(())
 }
 
-fn keys(smc: &Smc) -> Result<(), smc::Error> {
+fn keys(smc: &Smc) -> Res {
     for key in smc.keys()? {
         match smc.read(&key) {
             Ok(v) => print_value(&v),
@@ -144,4 +151,67 @@ fn print_value(v: &smc::Value) {
         Some(n) => println!("{}  [{}]  {n}  ({hex})", v.key, v.kind),
         None => println!("{}  [{}]  {hex}", v.key, v.kind),
     }
+}
+
+fn default_curve_path() -> String {
+    format!("{}/.config/gust/curve.conf", std::env::var("HOME").unwrap_or_default())
+}
+
+fn fan_ranges(smc: &Smc) -> Vec<(f64, f64)> {
+    let count = num(smc, "FNum").unwrap_or(0.0) as u32;
+    (0..count)
+        .filter_map(|i| Some((num(smc, &format!("F{i}Mn"))?, num(smc, &format!("F{i}Mx"))?)))
+        .collect()
+}
+
+/// Dry run only. Reads sensors and fan ranges, prints what the curve wants.
+fn curve_cmd(smc: &Smc, args: &[String]) -> Res {
+    let table = args.iter().any(|a| a == "--table");
+    let path = args.iter().find(|a| !a.starts_with("--")).cloned().unwrap_or_else(default_curve_path);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    let curve = curve::Curve::parse(&text).map_err(|e| format!("{path}: {e}"))?;
+    let fans = fan_ranges(smc);
+    let show = |t: Option<f64>| t.map_or("auto".to_string(), |r| format!("{r:.0}"));
+
+    if table {
+        print!("{:>6}", "temp");
+        for i in 0..fans.len() {
+            print!("  {:>6}", format!("fan{i}"));
+        }
+        println!();
+        for t in (40..=105).step_by(5) {
+            print!("{:>5}°", t);
+            for &(mn, mx) in &fans {
+                print!("  {:>6}", show(curve.target(t as f64, mn, mx)));
+            }
+            println!();
+        }
+        return Ok(());
+    }
+
+    let mut hottest: Option<(String, f64)> = None;
+    let mut matched = 0;
+    for key in smc.keys()? {
+        if !curve.matches(&key) {
+            continue;
+        }
+        let Some(c) = smc.read(&key).ok().and_then(|v| v.as_f64()) else { continue };
+        if !(1.0..=130.0).contains(&c) {
+            continue;
+        }
+        matched += 1;
+        if hottest.as_ref().is_none_or(|h| c > h.1) {
+            hottest = Some((key, c));
+        }
+    }
+    let Some((key, temp)) = hottest else {
+        return Err(format!("no sensors match `{}`", curve.sensors.join(" ")).into());
+    };
+    println!("{matched} sensors match; hottest is {key} at {temp:.1}°C");
+    for (i, &(mn, mx)) in fans.iter().enumerate() {
+        let now = num(smc, &format!("F{i}Ac")).unwrap_or(0.0);
+        println!("fan {i}: curve wants {:>5} RPM   (now {now:.0}, range {mn:.0}-{mx:.0})", show(curve.target(temp, mn, mx)));
+    }
+    println!("dry run: nothing was written to the fans");
+    Ok(())
 }
