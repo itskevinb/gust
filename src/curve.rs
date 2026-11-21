@@ -9,6 +9,9 @@
 //!   point 95 max                     at 95°C and above: full speed
 //!   ramp_up = 50                     optional: speed up at most 50 RPM/s
 //!   ramp_down = 30                   optional: slow down at most 30 RPM/s
+//!   shape = log                      optional: linear (default), log or exp
+//! `shape` bends every segment between two speeds: log rises fast then levels
+//! off, exp stays low then climbs steeply. The points themselves don't move.
 //! Between two points the speed ramps linearly. A segment that starts at
 //! `auto` stays `auto` until the next point is reached.
 
@@ -22,6 +25,46 @@ pub enum Speed {
     Max,
 }
 
+/// How speed moves between two points.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Shape {
+    #[default]
+    Linear,
+    /// log10(1 + 9f): fast rise, then levels off.
+    Log,
+    /// (10^f - 1) / 9: the inverse of Log; low, then steep.
+    Exp,
+}
+
+impl Shape {
+    /// Map a 0..1 position within a segment to a 0..1 share of the speed change.
+    pub fn apply(self, f: f64) -> f64 {
+        let f = f.clamp(0.0, 1.0);
+        match self {
+            Shape::Linear => f,
+            Shape::Log => (1.0 + 9.0 * f).log10(),
+            Shape::Exp => (10f64.powf(f) - 1.0) / 9.0,
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Shape> {
+        match s {
+            "linear" => Some(Shape::Linear),
+            "log" => Some(Shape::Log),
+            "exp" => Some(Shape::Exp),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Shape::Linear => "linear",
+            Shape::Log => "log",
+            Shape::Exp => "exp",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Curve {
     pub sensors: Vec<String>,
@@ -30,6 +73,7 @@ pub struct Curve {
     pub ramp_up: Option<f64>,
     /// Max RPM per second when slowing down. None = the built-in default.
     pub ramp_down: Option<f64>,
+    pub shape: Shape,
 }
 
 #[derive(Debug)]
@@ -61,6 +105,7 @@ impl Curve {
         let mut sensors = Vec::new();
         let mut points: Vec<(f64, Speed)> = Vec::new();
         let (mut ramp_up, mut ramp_down) = (None, None);
+        let mut shape = Shape::Linear;
         for (i, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap().trim();
             let err = |msg: &str| ParseError { line: i + 1, msg: msg.to_string() };
@@ -75,6 +120,10 @@ impl Curve {
                     return Err(err("ramp must be more than 0 RPM per second"));
                 }
                 if name.trim() == "ramp_up" { ramp_up = Some(v) } else { ramp_down = Some(v) }
+            } else if let Some((name, val)) = line.split_once('=')
+                && name.trim() == "shape"
+            {
+                shape = Shape::parse(val.trim()).ok_or_else(|| err("shape must be linear, log or exp"))?;
             } else if let Some(rest) = line.strip_prefix("sensors") {
                 let rest = rest.trim_start().strip_prefix('=').ok_or_else(|| err("expected `sensors = ...`"))?;
                 sensors = rest.split_whitespace().map(String::from).collect();
@@ -88,7 +137,7 @@ impl Curve {
                 }
                 points.push((t, s));
             } else {
-                return Err(err("unknown setting (expected `sensors =`, `point`, `ramp_up =` or `ramp_down =`)"));
+                return Err(err("unknown setting (expected `sensors =`, `point`, `shape =`, `ramp_up =` or `ramp_down =`)"));
             }
         }
         if sensors.is_empty() {
@@ -97,7 +146,7 @@ impl Curve {
         if points.is_empty() {
             return Err(ParseError { line: 0, msg: "no `point` lines".into() });
         }
-        Ok(Curve { sensors, points, ramp_up, ramp_down })
+        Ok(Curve { sensors, points, ramp_up, ramp_down, shape })
     }
 
     pub fn matches(&self, key: &str) -> bool {
@@ -128,7 +177,7 @@ impl Curve {
                     // high side (odd, but legal) takes over once we pass t0.
                     return if s0 == Speed::Auto { None } else { rpm(s0).map(clamp).filter(|_| s1 != Speed::Auto) };
                 };
-                return Some(clamp(r0 + (r1 - r0) * (temp - t0) / (t1 - t0)));
+                return Some(clamp(r0 + (r1 - r0) * self.shape.apply((temp - t0) / (t1 - t0))));
             }
         }
         rpm(self.points.last().unwrap().1).map(clamp)
@@ -147,15 +196,27 @@ impl fmt::Display for Speed {
 }
 
 /// Replace the `point` lines in a curve file with `points`, keeping every
-/// other line (comments, `sensors =`) where it was. New points go where the
-/// first old point was, or at the end if there were none. The result is
-/// parsed before it's returned, so a caller can never write a broken file.
-pub fn rewrite_points(original: &str, points: &[(f64, Speed)]) -> Result<String, ParseError> {
-    let block: String = points.iter().map(|(t, s)| format!("point {} {s}\n", (t * 10.0).round() / 10.0)).collect();
+/// other line (comments, `sensors =`, ramps) where it was. New points go where
+/// the first old point was, or at the end if there were none. With
+/// `shape = Some(..)` the `shape =` line is replaced too (or added after the
+/// points). The result is parsed before it's returned, so a caller can never
+/// write a broken file.
+pub fn rewrite_points(original: &str, points: &[(f64, Speed)], shape: Option<Shape>) -> Result<String, ParseError> {
+    let mut block: String = points.iter().map(|(t, s)| format!("point {} {s}\n", (t * 10.0).round() / 10.0)).collect();
+    let has_shape_line = original.lines().any(is_shape_line);
+    if let Some(sh) = shape
+        && !has_shape_line
+    {
+        block.push_str(&format!("shape = {}\n", sh.name()));
+    }
     let mut out = String::new();
     let mut placed = false;
     for line in original.lines() {
-        if line.trim_start().starts_with("point") {
+        if let Some(sh) = shape
+            && is_shape_line(line)
+        {
+            out.push_str(&format!("shape = {}\n", sh.name()));
+        } else if line.trim_start().starts_with("point") {
             if !placed {
                 out.push_str(&block);
                 placed = true;
@@ -172,6 +233,10 @@ pub fn rewrite_points(original: &str, points: &[(f64, Speed)]) -> Result<String,
     Ok(out)
 }
 
+fn is_shape_line(line: &str) -> bool {
+    line.split('#').next().unwrap().split_once('=').is_some_and(|(n, _)| n.trim() == "shape")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,14 +244,14 @@ mod tests {
     #[test]
     fn rewrite_keeps_comments_and_sensors() {
         let orig = "# mine\nsensors = Tp0*\n# pts\npoint 60 auto\npoint 90 max\n# end\n";
-        let out = rewrite_points(orig, &[(55.0, Speed::Auto), (70.0, Speed::Percent(25.0)), (99.5, Speed::Max)]).unwrap();
+        let out = rewrite_points(orig, &[(55.0, Speed::Auto), (70.0, Speed::Percent(25.0)), (99.5, Speed::Max)], None).unwrap();
         assert_eq!(out, "# mine\nsensors = Tp0*\n# pts\npoint 55 auto\npoint 70 25%\npoint 99.5 max\n# end\n");
     }
 
     #[test]
     fn rewrite_refuses_bad_points() {
-        assert!(rewrite_points("sensors = T*\n", &[(70.0, Speed::Max), (60.0, Speed::Auto)]).is_err());
-        assert!(rewrite_points("sensors = T*\n", &[]).is_err());
+        assert!(rewrite_points("sensors = T*\n", &[(70.0, Speed::Max), (60.0, Speed::Auto)], None).is_err());
+        assert!(rewrite_points("sensors = T*\n", &[], None).is_err());
     }
 
     const C: &str = "sensors = Tp0* TCDX\npoint 60 auto\npoint 70 0%\npoint 90 100%\npoint 95 max\n";
@@ -206,6 +271,32 @@ mod tests {
         let c = Curve::parse("sensors = T*\npoint 50 100\npoint 90 9000\n").unwrap();
         assert_eq!(c.target(40.0, 1500.0, 5500.0), Some(1500.0));
         assert_eq!(c.target(95.0, 1500.0, 5500.0), Some(5500.0));
+    }
+
+    #[test]
+    fn shapes() {
+        let lin = Curve::parse("sensors = T*\npoint 60 0%\npoint 100 100%\n").unwrap();
+        let log = Curve::parse("sensors = T*\npoint 60 0%\npoint 100 100%\nshape = log\n").unwrap();
+        let exp = Curve::parse("sensors = T*\npoint 60 0%\npoint 100 100%\nshape = exp\n").unwrap();
+        let at = |c: &Curve, t| c.target(t, 0.0, 1000.0).unwrap().round();
+        // Ends don't move; the middle bends.
+        for c in [&lin, &log, &exp] {
+            assert_eq!((at(c, 60.0), at(c, 100.0)), (0.0, 1000.0));
+        }
+        assert_eq!(at(&lin, 80.0), 500.0);
+        assert_eq!(at(&log, 80.0), 740.0); // log10(5.5)
+        assert_eq!(at(&exp, 80.0), 240.0); // (sqrt(10)-1)/9
+        assert!(Curve::parse("sensors = T*\npoint 60 0%\nshape = curvy\n").is_err());
+    }
+
+    #[test]
+    fn rewrite_sets_shape() {
+        let a = rewrite_points("sensors = T*\npoint 60 auto\n", &[(60.0, Speed::Max)], Some(Shape::Log)).unwrap();
+        assert_eq!(a, "sensors = T*\npoint 60 max\nshape = log\n");
+        let b = rewrite_points(&a, &[(60.0, Speed::Max)], Some(Shape::Exp)).unwrap();
+        assert_eq!(b, "sensors = T*\npoint 60 max\nshape = exp\n");
+        let c = rewrite_points(&b, &[(70.0, Speed::Max)], None).unwrap();
+        assert!(c.contains("shape = exp"));
     }
 
     #[test]

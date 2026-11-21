@@ -45,6 +45,7 @@
   button { font: inherit; padding: 5px 14px; border-radius: 6px; border: 1px solid var(--grid);
     background: var(--panel); color: var(--ink); cursor: pointer; }
   button.primary { background: var(--line); border-color: var(--line); color: #fff; }
+  select { font: inherit; margin-left: 4px; }
   button:disabled { opacity: .45; cursor: default; }
   #msg { min-width: 0; font-variant-numeric: tabular-nums; }
   #msg.ok { color: var(--ok); } #msg.err { color: var(--hot); }
@@ -56,12 +57,13 @@
 <footer>
   <span class="hint">Drag points · click empty space to add · double-click a point to remove · drag into the bottom lane for <b>auto</b></span>
   <span id="msg"></span>
+  <label>Shape <select id="shape"><option value="linear">Linear</option><option value="log">Log</option><option value="exp">Exp</option></select></label>
   <button id="revert">Revert</button>
   <button id="save" class="primary" disabled>Save</button>
 </footer>
 <div id="tip"></div>
 <script>
-// window.GUST = { points: [{t, auto, pct}], fans: [{min, max}], emergency } is injected by gust-bar.
+// window.GUST = { points: [{t, auto, pct}], fans: [{min, max}], emergency, shape } is injected by gust-bar.
 const G = window.GUST;
 const T0 = 40, T1 = 105;                 // x range, °C
 const NS = "http://www.w3.org/2000/svg";
@@ -70,7 +72,14 @@ const tip = document.getElementById("tip");
 const saveBtn = document.getElementById("save");
 const msg = document.getElementById("msg");
 let pts = G.points.map(p => ({ ...p }));
-let saved = JSON.stringify(pts);
+let shape = G.shape || "linear";
+const snapshot = () => JSON.stringify({ pts, shape });
+let saved = snapshot();
+const shapeSel = document.getElementById("shape");
+shapeSel.value = shape;
+shapeSel.addEventListener("change", () => { shape = shapeSel.value; draw(); });
+// Same as gust's Shape::apply.
+const bend = f => shape === "log" ? Math.log10(1 + 9 * f) : shape === "exp" ? (Math.pow(10, f) - 1) / 9 : f;
 let sel = -1, drag = -1, live = null;
 let W = 0, H = 0;
 const M = { l: 48, r: 64, t: 16, b: 66 };  // margins; bottom holds the auto lane + axis
@@ -99,7 +108,7 @@ function evalAt(t) {
     if (t < b.t) {
       if (a.auto) return null;
       if (b.auto) return a.pct;
-      return a.pct + (b.pct - a.pct) * (t - a.t) / (b.t - a.t);
+      return a.pct + (b.pct - a.pct) * bend((t - a.t) / (b.t - a.t));
     }
   }
   const last = pts[pts.length - 1];
@@ -164,7 +173,7 @@ function draw() {
     c.addEventListener("mousemove", e => showTip(e, p));
     c.addEventListener("mouseleave", () => { if (drag < 0) tip.style.display = "none"; });
   });
-  saveBtn.disabled = JSON.stringify(pts) === saved;
+  saveBtn.disabled = snapshot() === saved;
 }
 
 function label(p) {
@@ -218,17 +227,18 @@ window.addEventListener("keydown", e => {
 
 function save() {
   msg.className = ""; msg.textContent = "saving…";
-  window.ipc.postMessage(JSON.stringify({ cmd: "save", points: pts }));
+  window.ipc.postMessage(JSON.stringify({ cmd: "save", points: pts, shape }));
 }
 saveBtn.addEventListener("click", save);
 document.getElementById("revert").addEventListener("click", () => {
-  pts = JSON.parse(saved); sel = -1; msg.textContent = ""; draw();
+  const s0 = JSON.parse(saved); pts = s0.pts; shape = s0.shape; shapeSel.value = shape;
+  sel = -1; msg.textContent = ""; draw();
 });
 
 // Called by gust-bar.
 window.gustSaved = (ok, text) => {
   msg.className = ok ? "ok" : "err"; msg.textContent = text;
-  if (ok) saved = JSON.stringify(pts);
+  if (ok) saved = snapshot();
   draw();
 };
 window.gustLive = (l) => {

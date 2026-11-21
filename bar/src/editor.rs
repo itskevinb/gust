@@ -2,7 +2,7 @@
 //! picks up the saved file on its own (and rejects a bad one).
 
 use gust::control::EMERGENCY_C;
-use gust::curve::{self, Curve, Speed};
+use gust::curve::{self, Curve, Shape, Speed};
 use gust::fanctl::Fan;
 use serde_json::{Value, json};
 use tao::dpi::LogicalSize;
@@ -50,6 +50,7 @@ impl Editor {
             "points": points_json(&c, fans),
             "fans": fans.iter().map(|f| json!({"min": f.min, "max": f.max})).collect::<Vec<_>>(),
             "emergency": EMERGENCY_C,
+            "shape": c.shape.name(),
         });
         let window = WindowBuilder::new()
             .with_title("gust curve")
@@ -105,8 +106,12 @@ fn save(msg: &str, path: &str) -> Result<(), String> {
         };
         points.push((t, speed));
     }
+    let shape = match v["shape"].as_str() {
+        None => None,
+        Some(s) => Some(Shape::parse(s).ok_or("bad shape")?),
+    };
     let original = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let out = curve::rewrite_points(&original, &points).map_err(|e| e.to_string())?;
+    let out = curve::rewrite_points(&original, &points, shape).map_err(|e| e.to_string())?;
     // Atomic replace so gustd never reads a half-written file.
     let tmp = format!("{path}.tmp");
     std::fs::write(&tmp, out).map_err(|e| e.to_string())?;
@@ -138,6 +143,14 @@ mod tests {
         assert!(save(r#"{"cmd":"save","points":[{"t":80,"auto":false,"pct":50},{"t":70,"auto":true,"pct":0}]}"#, &p).is_err());
         assert!(save(r#"{"cmd":"save","points":[]}"#, &p).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn save_sets_shape() {
+        let p = tmpfile("sensors = Tp0*\npoint 60 auto\nramp_up = 50\n");
+        save(r#"{"cmd":"save","points":[{"t":60,"auto":false,"pct":100}],"shape":"log"}"#, &p).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "sensors = Tp0*\npoint 60 max\nshape = log\nramp_up = 50\n");
         std::fs::remove_file(p).unwrap();
     }
 
