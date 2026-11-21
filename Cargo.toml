@@ -2,6 +2,9 @@
 name = "gust"
 version = "0.1.0"
 edition = "2024"
+description = "Fan controller for Apple Silicon Macs: a curve you draw, a small root daemon with fail-safes, and a menu bar readout"
+license = "MIT"
+repository = "https://github.com/itskevinb/gust"
 
 [dependencies]
 

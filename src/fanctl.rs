@@ -42,6 +42,21 @@ impl FanControl {
     pub fn open() -> Result<Self, Error> {
         let smc = Smc::open()?;
         let fans = read_fans(&smc)?;
+        // gust writes F{n}Tg as a little-endian f32 and F{n}Md as one byte,
+        // which is what Apple Silicon uses. Intel Macs use other types (fpe2,
+        // FS! bitmask); refuse rather than write the wrong bytes.
+        for i in 0..fans.len() {
+            for (key, kind, size) in [(format!("F{i}Tg"), "flt ", 4), (format!("F{i}Md"), "ui8 ", 1)] {
+                let v = smc.read(&key)?;
+                if v.kind != kind || v.bytes.len() != size {
+                    return Err(Error::Unsupported(format!(
+                        "{key} is [{}] {} bytes, gust only knows [{kind}] {size} bytes (Apple Silicon)",
+                        v.kind,
+                        v.bytes.len()
+                    )));
+                }
+            }
+        }
         let has_ftst = smc.read("Ftst").is_ok();
         let forced = vec![false; fans.len()];
         Ok(FanControl { smc, fans, has_ftst, forced })

@@ -101,6 +101,7 @@ pub enum Error {
     Call(KernReturn),
     Smc { key: String, code: u8 },
     Size { key: String, want: usize, got: usize },
+    Unsupported(String),
 }
 
 impl fmt::Display for Error {
@@ -111,6 +112,7 @@ impl fmt::Display for Error {
             Error::Call(k) => write!(f, "IOConnectCallStructMethod failed: {k:#x}"),
             Error::Smc { key, code } => write!(f, "SMC error {code} on key {key}"),
             Error::Size { key, want, got } => write!(f, "{key}: SMC wants {want} bytes, got {got}"),
+            Error::Unsupported(m) => write!(f, "unsupported Mac: {m}"),
         }
     }
 }

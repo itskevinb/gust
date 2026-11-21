@@ -1,4 +1,4 @@
-//! Fan curve: a plain text file Kevin edits. Parsing and evaluation only;
+//! Fan curve: a plain text file you edit. Parsing and evaluation only;
 //! nothing here talks to the fans.
 //!
 //! Format (one setting per line, # starts a comment):

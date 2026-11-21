@@ -2,6 +2,9 @@
 name = "gust-bar"
 version = "0.1.0"
 edition = "2024"
+description = "Menu bar readout and curve editor for gust"
+license = "MIT"
+repository = "https://github.com/itskevinb/gust"
 
 [dependencies]
 gust = { version = "0.1.0", path = ".." }

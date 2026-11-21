@@ -19,7 +19,8 @@ const REFRESH: Duration = Duration::from_secs(2);
 /// Status older than this means gustd isn't running.
 const STALE_S: u64 = 10;
 
-// Sensor groups from the 2026-11-21 load test (see dev notes).
+// Menu readout groups, measured under CPU and GPU load on an M1 Max. Other
+// chips may name sensors differently; `gust temps` lists what yours has.
 const CPU: &[&str] = &["Tp0", "TC1", "TCDX"];
 const GPU: &[&str] = &["Tg", "TC2", "TC3"];
 
