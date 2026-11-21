@@ -10,6 +10,9 @@
 //!   ramp_up = 50                     optional: speed up at most 50 RPM/s
 //!   ramp_down = 30                   optional: slow down at most 30 RPM/s
 //!   shape = log                      optional: linear (default), log or exp
+//!   average = 20                     optional: curve follows the 20 s rolling
+//!                                    average temperature (the 100°C override
+//!                                    still uses the live reading)
 //! `shape` bends every segment between two speeds: log rises fast then levels
 //! off, exp stays low then climbs steeply. The points themselves don't move.
 //! Between two points the speed ramps linearly. A segment that starts at
@@ -74,6 +77,8 @@ pub struct Curve {
     /// Max RPM per second when slowing down. None = the built-in default.
     pub ramp_down: Option<f64>,
     pub shape: Shape,
+    /// Seconds of rolling average the curve follows. None = live reading.
+    pub average: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -106,6 +111,7 @@ impl Curve {
         let mut points: Vec<(f64, Speed)> = Vec::new();
         let (mut ramp_up, mut ramp_down) = (None, None);
         let mut shape = Shape::Linear;
+        let mut average = None;
         for (i, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap().trim();
             let err = |msg: &str| ParseError { line: i + 1, msg: msg.to_string() };
@@ -120,6 +126,14 @@ impl Curve {
                     return Err(err("ramp must be more than 0 RPM per second"));
                 }
                 if name.trim() == "ramp_up" { ramp_up = Some(v) } else { ramp_down = Some(v) }
+            } else if let Some((name, val)) = line.split_once('=')
+                && name.trim() == "average"
+            {
+                let v: f64 = val.trim().parse().map_err(|_| err("average must be a number of seconds"))?;
+                if !(0.0..=600.0).contains(&v) {
+                    return Err(err("average must be between 0 and 600 seconds"));
+                }
+                average = (v > 0.0).then_some(v);
             } else if let Some((name, val)) = line.split_once('=')
                 && name.trim() == "shape"
             {
@@ -137,7 +151,7 @@ impl Curve {
                 }
                 points.push((t, s));
             } else {
-                return Err(err("unknown setting (expected `sensors =`, `point`, `shape =`, `ramp_up =` or `ramp_down =`)"));
+                return Err(err("unknown setting (expected `sensors =`, `point`, `shape =`, `average =`, `ramp_up =` or `ramp_down =`)"));
             }
         }
         if sensors.is_empty() {
@@ -146,7 +160,7 @@ impl Curve {
         if points.is_empty() {
             return Err(ParseError { line: 0, msg: "no `point` lines".into() });
         }
-        Ok(Curve { sensors, points, ramp_up, ramp_down, shape })
+        Ok(Curve { sensors, points, ramp_up, ramp_down, shape, average })
     }
 
     pub fn matches(&self, key: &str) -> bool {
@@ -198,24 +212,22 @@ impl fmt::Display for Speed {
 /// Replace the `point` lines in a curve file with `points`, keeping every
 /// other line (comments, `sensors =`, ramps) where it was. New points go where
 /// the first old point was, or at the end if there were none. With
-/// `shape = Some(..)` the `shape =` line is replaced too (or added after the
-/// points). The result is parsed before it's returned, so a caller can never
-/// write a broken file.
-pub fn rewrite_points(original: &str, points: &[(f64, Speed)], shape: Option<Shape>) -> Result<String, ParseError> {
+/// `settings` (e.g. `[("shape", "log"), ("average", "20")]`), each `name =`
+/// line is replaced in place, or added after the points if missing. The
+/// result is parsed before it's returned, so a caller can never write a
+/// broken file.
+pub fn rewrite_points(original: &str, points: &[(f64, Speed)], settings: &[(&str, String)]) -> Result<String, ParseError> {
     let mut block: String = points.iter().map(|(t, s)| format!("point {} {s}\n", (t * 10.0).round() / 10.0)).collect();
-    let has_shape_line = original.lines().any(is_shape_line);
-    if let Some(sh) = shape
-        && !has_shape_line
-    {
-        block.push_str(&format!("shape = {}\n", sh.name()));
+    for (name, val) in settings {
+        if !original.lines().any(|l| setting_name(l) == Some(name)) {
+            block.push_str(&format!("{name} = {val}\n"));
+        }
     }
     let mut out = String::new();
     let mut placed = false;
     for line in original.lines() {
-        if let Some(sh) = shape
-            && is_shape_line(line)
-        {
-            out.push_str(&format!("shape = {}\n", sh.name()));
+        if let Some((name, val)) = settings.iter().find(|(n, _)| setting_name(line) == Some(n)) {
+            out.push_str(&format!("{name} = {val}\n"));
         } else if line.trim_start().starts_with("point") {
             if !placed {
                 out.push_str(&block);
@@ -233,8 +245,9 @@ pub fn rewrite_points(original: &str, points: &[(f64, Speed)], shape: Option<Sha
     Ok(out)
 }
 
-fn is_shape_line(line: &str) -> bool {
-    line.split('#').next().unwrap().split_once('=').is_some_and(|(n, _)| n.trim() == "shape")
+/// `Some("shape")` for a `shape = ...` line, etc.
+fn setting_name(line: &str) -> Option<&str> {
+    line.split('#').next().unwrap().split_once('=').map(|(n, _)| n.trim())
 }
 
 #[cfg(test)]
@@ -244,14 +257,14 @@ mod tests {
     #[test]
     fn rewrite_keeps_comments_and_sensors() {
         let orig = "# mine\nsensors = Tp0*\n# pts\npoint 60 auto\npoint 90 max\n# end\n";
-        let out = rewrite_points(orig, &[(55.0, Speed::Auto), (70.0, Speed::Percent(25.0)), (99.5, Speed::Max)], None).unwrap();
+        let out = rewrite_points(orig, &[(55.0, Speed::Auto), (70.0, Speed::Percent(25.0)), (99.5, Speed::Max)], &[]).unwrap();
         assert_eq!(out, "# mine\nsensors = Tp0*\n# pts\npoint 55 auto\npoint 70 25%\npoint 99.5 max\n# end\n");
     }
 
     #[test]
     fn rewrite_refuses_bad_points() {
-        assert!(rewrite_points("sensors = T*\n", &[(70.0, Speed::Max), (60.0, Speed::Auto)], None).is_err());
-        assert!(rewrite_points("sensors = T*\n", &[], None).is_err());
+        assert!(rewrite_points("sensors = T*\n", &[(70.0, Speed::Max), (60.0, Speed::Auto)], &[]).is_err());
+        assert!(rewrite_points("sensors = T*\n", &[], &[]).is_err());
     }
 
     const C: &str = "sensors = Tp0* TCDX\npoint 60 auto\npoint 70 0%\npoint 90 100%\npoint 95 max\n";
@@ -291,12 +304,22 @@ mod tests {
 
     #[test]
     fn rewrite_sets_shape() {
-        let a = rewrite_points("sensors = T*\npoint 60 auto\n", &[(60.0, Speed::Max)], Some(Shape::Log)).unwrap();
+        let a = rewrite_points("sensors = T*\npoint 60 auto\n", &[(60.0, Speed::Max)], &[("shape", "log".into())]).unwrap();
         assert_eq!(a, "sensors = T*\npoint 60 max\nshape = log\n");
-        let b = rewrite_points(&a, &[(60.0, Speed::Max)], Some(Shape::Exp)).unwrap();
+        let b = rewrite_points(&a, &[(60.0, Speed::Max)], &[("shape", "exp".into())]).unwrap();
         assert_eq!(b, "sensors = T*\npoint 60 max\nshape = exp\n");
-        let c = rewrite_points(&b, &[(70.0, Speed::Max)], None).unwrap();
+        let c = rewrite_points(&b, &[(70.0, Speed::Max)], &[]).unwrap();
         assert!(c.contains("shape = exp"));
+    }
+
+    #[test]
+    fn average_parses_and_rewrites() {
+        let c = Curve::parse("sensors = T*\npoint 60 max\naverage = 20\n").unwrap();
+        assert_eq!(c.average, Some(20.0));
+        assert_eq!(Curve::parse("sensors = T*\npoint 60 max\naverage = 0\n").unwrap().average, None);
+        assert!(Curve::parse("sensors = T*\npoint 60 max\naverage = 900\n").is_err());
+        let out = rewrite_points("sensors = T*\npoint 60 max\naverage = 20\n", &[(60.0, Speed::Max)], &[("average", "45".into())]).unwrap();
+        assert_eq!(out, "sensors = T*\npoint 60 max\naverage = 45\n");
     }
 
     #[test]

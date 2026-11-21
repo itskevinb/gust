@@ -211,9 +211,11 @@ fn refresh(smc: &Smc, cpu_keys: &[String], gpu_keys: &[String], ui: &Ui, tray: &
         Some(_) => ("gust is controlling the fans".to_string(), format!("{temp} {}", fmt_rpm(max_rpm)), "gust"),
     };
     ui.state.set_text(state);
-    ui.curve.set_text(match status.as_ref().and_then(|s| s["curve"].as_str()) {
-        Some("ok") | None => "Curve OK".to_string(),
-        Some(e) => format!("⚠︎ curve edit rejected: {e}"),
+    let avg = status.as_ref().and_then(|s| s["avg"].as_f64());
+    ui.curve.set_text(match (status.as_ref().and_then(|s| s["curve"].as_str()), avg) {
+        (Some(e), _) if e != "ok" => format!("⚠︎ curve edit rejected: {e}"),
+        (_, Some(a)) => format!("Curve OK · following average {a:.0}°C"),
+        _ => "Curve OK".to_string(),
     });
     tray.set_title(Some(title));
 
@@ -221,6 +223,7 @@ fn refresh(smc: &Smc, cpu_keys: &[String], gpu_keys: &[String], ui: &Ui, tray: &
         "temp": hottest.as_ref().map_or(0.0, |h| h.1),
         "sensor": hottest.as_ref().map_or("none".to_string(), |h| h.0.clone()),
         "mode": mode,
+        "avg": avg,
         "rpm": rpms.iter().map(|r| r.round()).collect::<Vec<_>>(),
     })
 }

@@ -3,6 +3,7 @@
 
 use crate::curve::Curve;
 use crate::fanctl::Fan;
+use std::collections::VecDeque;
 
 /// At or above this, every fan goes to max whatever the curve says.
 pub const EMERGENCY_C: f64 = 100.0;
@@ -25,37 +26,75 @@ pub struct Controller {
     last: Option<Vec<f64>>,
     auto_since: Option<f64>,
     last_t: Option<f64>,
+    /// Recent (t, temp) samples for the curve's `average` window.
+    hist: VecDeque<(f64, f64)>,
+    avg: Option<f64>,
 }
 
 impl Controller {
     pub fn new(fans: Vec<Fan>) -> Self {
-        Controller { fans, last: None, auto_since: None, last_t: None }
+        Controller { fans, last: None, auto_since: None, last_t: None, hist: VecDeque::new(), avg: None }
     }
 
-    /// Forget state, e.g. after wake from sleep or after a release.
+    /// Forget everything, e.g. after wake from sleep or after sensor loss.
     pub fn reset(&mut self) {
+        self.release_state();
+        self.hist.clear();
+        self.avg = None;
+    }
+
+    /// Forget fan state only (handing back to macOS); keep the temperature history.
+    fn release_state(&mut self) {
         self.last = None;
         self.auto_since = None;
         self.last_t = None;
     }
 
-    /// `temp`: hottest matching sensor, °C. `t`: seconds, monotonic.
+    /// The temperature the curve used on the last step (the average, if the
+    /// curve sets `average`, otherwise the live reading).
+    pub fn curve_temp(&self) -> Option<f64> {
+        self.avg
+    }
+
+    /// Rolling mean of finite readings within the curve's window.
+    fn smooth(&mut self, curve: &Curve, temp: f64, t: f64) -> f64 {
+        let Some(win) = curve.average else {
+            self.hist.clear();
+            return temp;
+        };
+        if temp.is_finite() {
+            self.hist.push_back((t, temp));
+        }
+        while self.hist.front().is_some_and(|(ht, _)| t - ht > win) {
+            self.hist.pop_front();
+        }
+        if self.hist.is_empty() {
+            return temp;
+        }
+        self.hist.iter().map(|h| h.1).sum::<f64>() / self.hist.len() as f64
+    }
+
+    /// `temp`: hottest matching sensor right now, °C. `t`: seconds, monotonic.
+    /// The curve sees the rolling average (if set); the emergency check always
+    /// uses the live reading.
     pub fn step(&mut self, curve: &Curve, temp: f64, t: f64) -> Decision {
         let dt = self.last_t.map_or(0.0, |lt| (t - lt).max(0.0));
         self.last_t = Some(t);
+        let smoothed = self.smooth(curve, temp, t);
+        self.avg = Some(smoothed);
 
         let emergency = temp >= EMERGENCY_C || !temp.is_finite();
         let wanted: Vec<Option<f64>> = if emergency {
             self.fans.iter().map(|f| Some(f.max)).collect()
         } else {
-            self.fans.iter().map(|f| curve.target(temp, f.min, f.max)).collect()
+            self.fans.iter().map(|f| curve.target(smoothed, f.min, f.max)).collect()
         };
 
         if wanted.iter().all(Option::is_none) {
             let Some(last) = self.last.clone() else { return Decision::Auto };
             let since = *self.auto_since.get_or_insert(t);
             if t - since >= AUTO_HOLD_S {
-                self.reset();
+                self.release_state();
                 return Decision::Auto;
             }
             // Still holding: ease toward each fan's minimum.
@@ -170,6 +209,33 @@ mod tests {
         let mut c = Controller::new(fans());
         c.step(&slow(), 70.0, 0.0);
         assert_eq!(c.step(&slow(), 101.0, 2.0), Decision::Set(vec![5500.0, 5800.0]));
+    }
+
+    #[test]
+    fn average_smooths_spikes() {
+        let c = Curve::parse("sensors = T*\npoint 60 0%\npoint 100 100%\naverage = 10\n").unwrap();
+        let mut ctl = Controller::new(vec![Fan { min: 0.0, max: 1000.0 }]);
+        for i in 0..5 {
+            ctl.step(&c, 60.0, i as f64 * 2.0);
+        }
+        // One 90°C spike among five 60°C readings: the curve sees 65°C.
+        assert_eq!(ctl.step(&c, 90.0, 10.0), Decision::Set(vec![125.0]));
+        assert_eq!(ctl.curve_temp(), Some(65.0));
+        // Old samples fall out of the 10 s window.
+        for i in 6..12 {
+            ctl.step(&c, 90.0, i as f64 * 2.0);
+        }
+        assert_eq!(ctl.curve_temp(), Some(90.0));
+    }
+
+    #[test]
+    fn average_never_delays_emergency() {
+        let c = Curve::parse("sensors = T*\npoint 60 0%\npoint 100 100%\naverage = 60\n").unwrap();
+        let mut ctl = Controller::new(vec![Fan { min: 0.0, max: 1000.0 }]);
+        for i in 0..20 {
+            ctl.step(&c, 50.0, i as f64 * 2.0);
+        }
+        assert_eq!(ctl.step(&c, 101.0, 40.0), Decision::Set(vec![1000.0]));
     }
 
     #[test]

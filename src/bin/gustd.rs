@@ -248,7 +248,10 @@ fn run(path: &str, dry: bool) -> i32 {
             _ => true,
         };
         if dry || big_move || last_log_at.elapsed() >= LOG_HEARTBEAT {
-            let t = reading.as_ref().map_or("no sensors".into(), |(k, c, _)| format!("{k} {c:.1}°C"));
+            let mut t = reading.as_ref().map_or("no sensors".into(), |(k, c, _)| format!("{k} {c:.1}°C"));
+            if let (Some(win), Some(a)) = (loaded.curve.average, ctl.curve_temp()) {
+                t.push_str(&format!(" (avg {win:.0}s {a:.1}°C)"));
+            }
             let d = now_targets
                 .as_ref()
                 .map_or("auto".into(), |r| r.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join("/"));
@@ -257,7 +260,8 @@ fn run(path: &str, dry: bool) -> i32 {
             last_log_at = Instant::now();
         }
         if !dry {
-            write_status(&smc, &fans, &reading, &decision, curve_err.as_deref());
+            let avg = loaded.curve.average.and(ctl.curve_temp());
+            write_status(&smc, &fans, &reading, avg, &decision, curve_err.as_deref());
         }
         sleep_tick();
     }
@@ -284,6 +288,7 @@ fn write_status(
     smc: &Smc,
     fans: &[gust::fanctl::Fan],
     reading: &Option<(String, f64, usize)>,
+    avg: Option<f64>,
     decision: &Decision,
     curve_err: Option<&str>,
 ) {
@@ -302,9 +307,10 @@ fn write_status(
     }
     let (sensor, temp) = reading.as_ref().map_or(("null".into(), "null".into()), |(k, c, _)| (json_str(k), format!("{c:.1}")));
     let mode = if matches!(decision, Decision::Auto) { "auto" } else { "gust" };
+    let avg = avg.map_or("null".into(), |a| format!("{a:.1}"));
     let curve = curve_err.map_or("\"ok\"".into(), json_str);
     let body = format!(
-        "{{\"time\":{t},\"mode\":\"{mode}\",\"sensor\":{sensor},\"temp\":{temp},\"curve\":{curve},\"fans\":[{}]}}\n",
+        "{{\"time\":{t},\"mode\":\"{mode}\",\"sensor\":{sensor},\"temp\":{temp},\"avg\":{avg},\"curve\":{curve},\"fans\":[{}]}}\n",
         fan_json.join(",")
     );
     let tmp = format!("{}.tmp", gust::STATUS_PATH);

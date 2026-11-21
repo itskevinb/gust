@@ -51,6 +51,7 @@ impl Editor {
             "fans": fans.iter().map(|f| json!({"min": f.min, "max": f.max})).collect::<Vec<_>>(),
             "emergency": EMERGENCY_C,
             "shape": c.shape.name(),
+            "average": c.average.unwrap_or(0.0),
         });
         let window = WindowBuilder::new()
             .with_title("gust curve")
@@ -106,12 +107,18 @@ fn save(msg: &str, path: &str) -> Result<(), String> {
         };
         points.push((t, speed));
     }
-    let shape = match v["shape"].as_str() {
-        None => None,
-        Some(s) => Some(Shape::parse(s).ok_or("bad shape")?),
-    };
+    let mut settings: Vec<(&str, String)> = Vec::new();
+    if let Some(s) = v["shape"].as_str() {
+        settings.push(("shape", Shape::parse(s).ok_or("bad shape")?.name().to_string()));
+    }
+    if let Some(a) = v["average"].as_f64() {
+        if !(0.0..=600.0).contains(&a) {
+            return Err("average must be 0 to 600 seconds".into());
+        }
+        settings.push(("average", format!("{}", a.round())));
+    }
     let original = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let out = curve::rewrite_points(&original, &points, shape).map_err(|e| e.to_string())?;
+    let out = curve::rewrite_points(&original, &points, &settings).map_err(|e| e.to_string())?;
     // Atomic replace so gustd never reads a half-written file.
     let tmp = format!("{path}.tmp");
     std::fs::write(&tmp, out).map_err(|e| e.to_string())?;
@@ -151,6 +158,15 @@ mod tests {
         let p = tmpfile("sensors = Tp0*\npoint 60 auto\nramp_up = 50\n");
         save(r#"{"cmd":"save","points":[{"t":60,"auto":false,"pct":100}],"shape":"log"}"#, &p).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "sensors = Tp0*\npoint 60 max\nshape = log\nramp_up = 50\n");
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn save_sets_average() {
+        let p = tmpfile("sensors = Tp0*\npoint 60 auto\n# keep\n");
+        save(r#"{"cmd":"save","points":[{"t":60,"auto":true,"pct":0}],"shape":"linear","average":20}"#, &p).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "sensors = Tp0*\npoint 60 auto\nshape = linear\naverage = 20\n# keep\n");
+        assert!(save(r#"{"cmd":"save","points":[{"t":60,"auto":true,"pct":0}],"average":9000}"#, &p).is_err());
         std::fs::remove_file(p).unwrap();
     }
 
