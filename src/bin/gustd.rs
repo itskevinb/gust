@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TICK: Duration = Duration::from_secs(2);
+const LOG_STEP_RPM: f64 = 500.0;
+const LOG_HEARTBEAT: Duration = Duration::from_secs(300);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -154,7 +156,8 @@ fn run(path: &str, dry: bool) -> i32 {
     let mut read_fails = 0;
     let mut write_fails = 0;
     let mut released = true;
-    let mut last_decision = String::new();
+    let mut last_logged: Option<Vec<f64>> = None;
+    let mut last_log_at = Instant::now();
 
     while !STOP.load(Ordering::SeqCst) {
         // Sleep/wake: wall clock jumped well past one tick.
@@ -234,14 +237,24 @@ fn run(path: &str, dry: bool) -> i32 {
             }
         }
 
-        let d = match &decision {
-            Decision::Auto => "auto".to_string(),
-            Decision::Set(r) => r.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join("/"),
+        // Log mode changes, big moves (>= LOG_STEP_RPM) and a heartbeat; not every tick.
+        let now_targets = match &decision {
+            Decision::Auto => None,
+            Decision::Set(r) => Some(r.clone()),
         };
-        if dry || d != last_decision {
+        let big_move = match (&now_targets, &last_logged) {
+            (None, None) => false,
+            (Some(a), Some(b)) => a.iter().zip(b).any(|(x, y)| (x - y).abs() >= LOG_STEP_RPM),
+            _ => true,
+        };
+        if dry || big_move || last_log_at.elapsed() >= LOG_HEARTBEAT {
             let t = reading.as_ref().map_or("no sensors".into(), |(k, c, _)| format!("{k} {c:.1}°C"));
+            let d = now_targets
+                .as_ref()
+                .map_or("auto".into(), |r| r.iter().map(|v| format!("{v:.0}")).collect::<Vec<_>>().join("/"));
             log(&format!("{t} -> {d}"));
-            last_decision = d;
+            last_logged = now_targets;
+            last_log_at = Instant::now();
         }
         if !dry {
             write_status(&smc, &fans, &reading, &decision, curve_err.as_deref());
