@@ -1,13 +1,12 @@
-mod curve;
-mod smc;
+use gust::{curve, smc};
 
-use smc::Smc;
+use gust::smc::Smc;
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 type Res = Result<(), Box<dyn std::error::Error>>;
 
-const USAGE: &str = "gust: Mac fan and temperature tool (read-only so far: nothing writes to the fans)
+const USAGE: &str = "gust: Mac fan and temperature tool. This CLI never writes to the fans; gustd does.
 
 usage:
   gust fans          fan RPM (actual, min, max, target) and mode
@@ -15,6 +14,7 @@ usage:
   gust read KEY...   raw value of specific SMC keys (e.g. gust read F0Ac)
   gust keys          dump every SMC key with its type and value
   gust snap          KEY VALUE lines for every temp + fan RPM (for logging)
+  gust status        what gustd is doing right now
   gust curve [FILE]  dry run: what the curve would set the fans to right now
   gust curve --table [FILE]  the curve as a temp -> RPM table
                      (FILE defaults to ~/.config/gust/curve.conf)";
@@ -35,6 +35,7 @@ fn main() -> ExitCode {
         Some("snap") => snap(&smc),
         Some("read") if args.len() > 1 => read(&smc, &args[1..]),
         Some("curve") => curve_cmd(&smc, &args[1..]),
+        Some("status") => status(),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -61,7 +62,7 @@ fn fans(smc: &Smc) -> Res {
         let get = |k: &str| num(smc, &format!("F{i}{k}"));
         let rpm = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.0}"));
         let mode = match get("Md") {
-            Some(m) if m == 0.0 => "auto".to_string(),
+            Some(0.0) => "auto".to_string(),
             Some(m) => format!("forced ({m:.0})"),
             None => "?".to_string(),
         };
@@ -111,11 +112,10 @@ fn snap(smc: &Smc) -> Res {
             continue;
         }
         if let Ok(v) = smc.read(&key) {
-            if v.kind == "flt " || v.kind == "sp78" || v.kind == "fpe2" {
-                if let Some(n) = v.as_f64() {
+            if (v.kind == "flt " || v.kind == "sp78" || v.kind == "fpe2")
+                && let Some(n) = v.as_f64() {
                     println!("{key} {n:.2}");
                 }
-            }
         }
     }
     Ok(())
@@ -214,4 +214,14 @@ fn curve_cmd(smc: &Smc, args: &[String]) -> Res {
     }
     println!("dry run: nothing was written to the fans");
     Ok(())
+}
+
+fn status() -> Res {
+    match std::fs::read_to_string(gust::STATUS_PATH) {
+        Ok(s) => {
+            println!("{}", s.trim());
+            Ok(())
+        }
+        Err(e) => Err(format!("{}: {e} (is gustd running?)", gust::STATUS_PATH).into()),
+    }
 }

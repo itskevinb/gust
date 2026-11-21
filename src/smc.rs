@@ -1,7 +1,7 @@
-//! Read-only access to the Apple SMC through IOKit.
+//! Access to the Apple SMC through IOKit.
 //!
-//! There is deliberately no write path in this module. Writing fan keys
-//! needs root and will live in a separate privileged helper later.
+//! Reads are public. The single write primitive is crate-private and is only
+//! called from `fanctl`, which restricts it to fan keys and fan ranges.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -14,6 +14,7 @@ type IoConnect = MachPort;
 const KERN_SUCCESS: KernReturn = 0;
 const KERNEL_INDEX_SMC: u32 = 2;
 const CMD_READ_BYTES: u8 = 5;
+const CMD_WRITE_BYTES: u8 = 6;
 const CMD_READ_INDEX: u8 = 8;
 const CMD_READ_KEYINFO: u8 = 9;
 
@@ -99,6 +100,7 @@ pub enum Error {
     Open(KernReturn),
     Call(KernReturn),
     Smc { key: String, code: u8 },
+    Size { key: String, want: usize, got: usize },
 }
 
 impl fmt::Display for Error {
@@ -108,6 +110,7 @@ impl fmt::Display for Error {
             Error::Open(k) => write!(f, "IOServiceOpen failed: {k:#x}"),
             Error::Call(k) => write!(f, "IOConnectCallStructMethod failed: {k:#x}"),
             Error::Smc { key, code } => write!(f, "SMC error {code} on key {key}"),
+            Error::Size { key, want, got } => write!(f, "{key}: SMC wants {want} bytes, got {got}"),
         }
     }
 }
@@ -195,6 +198,20 @@ impl Smc {
         let out = self.call(&req)?;
         let n = (info.data_size as usize).min(32);
         Ok(Value { key: fourcc_str(key), kind: fourcc_str(info.data_type), bytes: out.bytes[..n].to_vec() })
+    }
+
+    /// Raw write. Size must match the key's own size. Needs root.
+    /// Only `fanctl` calls this; keep it that way.
+    pub(crate) fn write(&self, key: &str, bytes: &[u8]) -> Result<(), Error> {
+        let k = fourcc(key);
+        let info = self.call(&KeyData { key: k, data8: CMD_READ_KEYINFO, ..Default::default() })?.key_info;
+        if info.data_size as usize != bytes.len() || bytes.len() > 32 {
+            return Err(Error::Size { key: key.to_string(), want: info.data_size as usize, got: bytes.len() });
+        }
+        let mut req = KeyData { key: k, data8: CMD_WRITE_BYTES, ..Default::default() };
+        req.key_info.data_size = info.data_size;
+        req.bytes[..bytes.len()].copy_from_slice(bytes);
+        self.call(&req).map(|_| ())
     }
 
     /// Every key the SMC knows about, in index order.
