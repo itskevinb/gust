@@ -120,9 +120,59 @@ impl Curve {
     }
 }
 
+impl fmt::Display for Speed {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Speed::Auto => write!(f, "auto"),
+            Speed::Max => write!(f, "max"),
+            Speed::Rpm(r) => write!(f, "{r:.0}"),
+            Speed::Percent(p) => write!(f, "{}%", (p * 10.0).round() / 10.0),
+        }
+    }
+}
+
+/// Replace the `point` lines in a curve file with `points`, keeping every
+/// other line (comments, `sensors =`) where it was. New points go where the
+/// first old point was, or at the end if there were none. The result is
+/// parsed before it's returned, so a caller can never write a broken file.
+pub fn rewrite_points(original: &str, points: &[(f64, Speed)]) -> Result<String, ParseError> {
+    let block: String = points.iter().map(|(t, s)| format!("point {} {s}\n", (t * 10.0).round() / 10.0)).collect();
+    let mut out = String::new();
+    let mut placed = false;
+    for line in original.lines() {
+        if line.trim_start().starts_with("point") {
+            if !placed {
+                out.push_str(&block);
+                placed = true;
+            }
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !placed {
+        out.push_str(&block);
+    }
+    Curve::parse(&out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewrite_keeps_comments_and_sensors() {
+        let orig = "# mine\nsensors = Tp0*\n# pts\npoint 60 auto\npoint 90 max\n# end\n";
+        let out = rewrite_points(orig, &[(55.0, Speed::Auto), (70.0, Speed::Percent(25.0)), (99.5, Speed::Max)]).unwrap();
+        assert_eq!(out, "# mine\nsensors = Tp0*\n# pts\npoint 55 auto\npoint 70 25%\npoint 99.5 max\n# end\n");
+    }
+
+    #[test]
+    fn rewrite_refuses_bad_points() {
+        assert!(rewrite_points("sensors = T*\n", &[(70.0, Speed::Max), (60.0, Speed::Auto)]).is_err());
+        assert!(rewrite_points("sensors = T*\n", &[]).is_err());
+    }
 
     const C: &str = "sensors = Tp0* TCDX\npoint 60 auto\npoint 70 0%\npoint 90 100%\npoint 95 max\n";
 
