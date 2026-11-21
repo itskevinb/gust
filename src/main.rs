@@ -10,7 +10,8 @@ usage:
   gust fans          fan RPM (actual, min, max, target) and mode
   gust temps         every temperature sensor, grouped by key prefix
   gust read KEY...   raw value of specific SMC keys (e.g. gust read F0Ac)
-  gust keys          dump every SMC key with its type and value";
+  gust keys          dump every SMC key with its type and value
+  gust snap          KEY VALUE lines for every temp + fan RPM (for logging)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,6 +26,7 @@ fn main() -> ExitCode {
         Some("fans") | None => fans(&smc),
         Some("temps") => temps(&smc),
         Some("keys") => keys(&smc),
+        Some("snap") => snap(&smc),
         Some("read") if args.len() > 1 => read(&smc, &args[1..]),
         _ => {
             eprintln!("{USAGE}");
@@ -91,6 +93,23 @@ fn temps(smc: &Smc) -> Result<(), smc::Error> {
         println!("{prefix}*  {} sensor(s)  avg {avg:5.1}°C  max {max:5.1}°C", sensors.len());
         let line: Vec<String> = sensors.iter().map(|(k, c)| format!("{k} {c:.1}")).collect();
         println!("     {}", line.join("  "));
+    }
+    Ok(())
+}
+
+/// One line per numeric T* key and fan RPM: "KEY VALUE". For logging.
+fn snap(smc: &Smc) -> Result<(), smc::Error> {
+    for key in smc.keys()? {
+        if !(key.starts_with('T') || (key.starts_with('F') && key.ends_with("Ac"))) {
+            continue;
+        }
+        if let Ok(v) = smc.read(&key) {
+            if v.kind == "flt " || v.kind == "sp78" || v.kind == "fpe2" {
+                if let Some(n) = v.as_f64() {
+                    println!("{key} {n:.2}");
+                }
+            }
+        }
     }
     Ok(())
 }
